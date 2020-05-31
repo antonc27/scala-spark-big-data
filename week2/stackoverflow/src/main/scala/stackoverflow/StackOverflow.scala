@@ -8,7 +8,13 @@ import annotation.tailrec
 import scala.reflect.ClassTag
 
 /** A raw stackoverflow posting, either a question or an answer */
-case class Posting(postingType: Int, id: Int, acceptedAnswer: Option[Int], parentId: Option[QID], score: Int, tags: Option[String]) extends Serializable
+case class Posting(postingType: Int,
+                   id: Int,
+                   acceptedAnswer: Option[Int],
+                   parentId: Option[QID],
+                   score: Int,
+                   tags: Option[String]
+                  ) extends Serializable
 
 
 /** The main class */
@@ -23,9 +29,9 @@ object StackOverflow extends StackOverflow {
     val lines   = sc.textFile("src/main/resources/stackoverflow/stackoverflow.csv")
     val raw     = rawPostings(lines)
     val grouped = groupedPostings(raw)
-    val scored  = scoredPostings(grouped)
+    val scored  = scoredPostings(grouped)//.sample(true, 0.1, 0)
     val vectors = vectorPostings(scored)
-//    assert(vectors.count() == 2121822, "Incorrect number of vectors: " + vectors.count())
+    assert(vectors.count() == 2121822, "Incorrect number of vectors: " + vectors.count())
 
     val means   = kmeans(sampleVectors(vectors), vectors, debug = true)
     val results = clusterResults(means, vectors)
@@ -77,7 +83,10 @@ class StackOverflow extends StackOverflowInterface with Serializable {
 
   /** Group the questions and answers together */
   def groupedPostings(postings: RDD[Posting]): RDD[(QID, Iterable[(Question, Answer)])] = {
-    ???
+    val questions: RDD[(QID, Question)] = postings.filter(_.postingType == 1).map(p => (p.id, p))
+    val answers: RDD[(QID, Answer)] = postings.filter(_.postingType == 2).map(p => (p.parentId.get, p))
+
+    questions.join(answers).groupByKey()
   }
 
 
@@ -96,7 +105,9 @@ class StackOverflow extends StackOverflowInterface with Serializable {
       highScore
     }
 
-    ???
+    grouped.map { case (_, group: Iterable[(Question, Answer)]) =>
+      (group.head._1, group.map(_._2).toArray)
+    }.mapValues(answerHighScore)
   }
 
 
@@ -116,7 +127,14 @@ class StackOverflow extends StackOverflowInterface with Serializable {
       }
     }
 
-    ???
+    scored.flatMap { case (q: Question, hs: HighScore) =>
+      val langIndex = firstLangInTag(q.tags, langs).map(_ * langSpread)
+      if (langIndex.isEmpty) {
+        None
+      } else {
+        Some((langIndex.get, hs))
+      }
+    }.cache()
   }
 
 
@@ -171,9 +189,19 @@ class StackOverflow extends StackOverflowInterface with Serializable {
 
   /** Main kmeans computation */
   @tailrec final def kmeans(means: Array[(Int, Int)], vectors: RDD[(Int, Int)], iter: Int = 1, debug: Boolean = false): Array[(Int, Int)] = {
-    val newMeans = means.clone() // you need to compute newMeans
+    val newMeans = means.clone()
 
-    // TODO: Fill in the newMeans array
+    val updates = vectors
+      .map(p => (findClosest(p, means), p))
+      .groupByKey()
+      .mapValues(averageVectors)
+      .sortByKey()
+      .collect()
+
+    updates.foreach { case (idx: Int, newP: (Int, Int)) =>
+      newMeans.update(idx, newP)
+    }
+
     val distance = euclideanDistance(means, newMeans)
 
     if (debug) {
@@ -274,15 +302,29 @@ class StackOverflow extends StackOverflowInterface with Serializable {
     val closestGrouped = closest.groupByKey()
 
     val median = closestGrouped.mapValues { vs =>
-      val langLabel: String   = ??? // most common language in the cluster
-      val langPercent: Double = ??? // percent of the questions in the most common language
-      val clusterSize: Int    = ???
-      val medianScore: Int    = ???
+      val totalCount = vs.size
+      val (idx, count) = vs.groupBy(_._1).mapValues(_.size).maxBy(_._2)
+      val langLabel: String   = langs(idx / langSpread) // most common language in the cluster
+      val langPercent: Double = count / totalCount * 100 // percent of the questions in the most common language
+      val clusterSize: Int    = totalCount
+      val medianScore: Int    = getMedian[Int, Double](vs.filter(_._1 == idx).map(_._2).toList).toInt
 
       (langLabel, langPercent, clusterSize, medianScore)
     }
 
     median.collect().map(_._2).sortBy(_._4)
+  }
+
+  // from https://stackoverflow.com/a/51901627/2241008
+  private def getMedian[T: Ordering, F]
+    (seq: Seq[T])
+    (implicit conv: T => F, f: Fractional[F]): F = {
+      val sortedSeq = seq.sorted
+      if (seq.size % 2 == 1) sortedSeq(sortedSeq.size / 2) else {
+        val (up, down) = sortedSeq.splitAt(seq.size / 2)
+        import f._
+        (conv(up.last) + conv(down.head)) / fromInt(2)
+      }
   }
 
   def printResults(results: Array[(String, Double, Int, Int)]): Unit = {
