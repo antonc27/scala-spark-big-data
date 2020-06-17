@@ -3,6 +3,8 @@ package timeusage
 import org.apache.spark.sql._
 import org.apache.spark.sql.types._
 
+import scala.collection.mutable.ListBuffer
+
 /** Main class */
 object TimeUsage extends TimeUsageInterface {
 
@@ -43,7 +45,7 @@ object TimeUsage extends TimeUsageInterface {
     * @param line Raw fields
     */
   def row(line: List[String]): Row =
-    ???
+    Row.fromSeq(Seq(line.head) ++ line.tail.map(_.toDouble))
 
   /** @return The initial data frame columns partitioned in three groups: primary needs (sleeping, eating, etc.),
     *         work and other (leisure activities)
@@ -61,7 +63,17 @@ object TimeUsage extends TimeUsageInterface {
     *    “t10”, “t12”, “t13”, “t14”, “t15”, “t16” and “t18” (those which are not part of the previous groups only).
     */
   def classifiedColumns(columnNames: List[String]): (List[Column], List[Column], List[Column]) = {
-    ???
+    var primary: ListBuffer[Column] = ListBuffer()
+    var working: ListBuffer[Column] = ListBuffer()
+    var leisure: ListBuffer[Column] = ListBuffer()
+    columnNames.foreach {
+      case prim if Seq("t01", "t03", "t11", "t1801", "t1803").exists(prim.startsWith) => primary += col(prim)
+      case work if Seq("t05", "t1805").exists(work.startsWith) => working += col(work)
+      case other if Seq("t02", "t04", "t06", "t07", "t08", "t09",
+        "t10", "t12", "t13", "t14", "t15", "t16", "t18").exists(other.startsWith) => leisure += col(other)
+      case _ =>
+    }
+    (primary.toList, working.toList, leisure.toList)
   }
 
   /** @return a projection of the initial DataFrame such that all columns containing hours spent on primary needs
@@ -104,18 +116,29 @@ object TimeUsage extends TimeUsageInterface {
     // more sense for our use case
     // Hint: you can use the `when` and `otherwise` Spark functions
     // Hint: don’t forget to give your columns the expected name with the `as` method
-    val workingStatusProjection: Column = ???
-    val sexProjection: Column = ???
-    val ageProjection: Column = ???
+    val workingStatusProjection: Column = when($"telfs" >= 1 && $"telfs" < 3, "working")
+      .otherwise("not working").as("working")
+    val sexProjection: Column = when($"tesex" === 1, "male")
+      .otherwise("female").as("sex")
+    val ageProjection: Column = when($"teage" >= 15 && $"teage" <= 22, "young")
+      .when($"teage" >= 23 && $"teage" <= 55, "active")
+      .otherwise("elder").as("age")
 
     // Create columns that sum columns of the initial dataset
     // Hint: you want to create a complex column expression that sums other columns
     //       by using the `+` operator between them
     // Hint: don’t forget to convert the value to hours
-    val primaryNeedsProjection: Column = ???
-    val workProjection: Column = ???
-    val otherProjection: Column = ???
+
+    def createColumns(columns: List[Column], colName: String) =
+      columns.foldLeft(col(colName))((res, c) => res + c/60.0).as(colName)
+
+    val primaryNeedsProjection: Column = createColumns(primaryNeedsColumns, "primaryNeeds")
+    val workProjection: Column = createColumns(workColumns, "work")
+    val otherProjection: Column = createColumns(otherColumns, "other")
     df
+      .withColumn("primaryNeeds", lit(0.0))
+      .withColumn("work", lit(0.0))
+      .withColumn("other", lit(0.0))
       .select(workingStatusProjection, sexProjection, ageProjection, primaryNeedsProjection, workProjection, otherProjection)
       .where($"telfs" <= 4) // Discard people who are not in labor force
   }
@@ -138,7 +161,14 @@ object TimeUsage extends TimeUsageInterface {
     * Finally, the resulting DataFrame should be sorted by working status, sex and age.
     */
   def timeUsageGrouped(summed: DataFrame): DataFrame = {
-    ???
+    summed
+      .groupBy($"working", $"sex", $"age")
+      .agg(
+        round(avg($"primaryNeeds"), 1) as "primaryNeeds",
+        round(avg($"work"), 1) as "work",
+        round(avg($"other"), 1) as "other"
+      )
+      .orderBy($"working", $"sex", $"age")
   }
 
   /**
